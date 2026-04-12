@@ -9,50 +9,68 @@ export default function ThreadCard({
   thread,
   show_forum_name,
   user_link,
+  show_avatar = true,
+  show_author_name = true,
 }: {
   thread: ThreadRow;
   show_forum_name?: boolean;
   user_link?: boolean;
+  show_avatar?: boolean;
+  show_author_name?: boolean;
 }) {
+  const authorHref = `/user/${thread.author_id}`;
+
   return (
-    <div className="relative bg-white rounded-md shadow pt-3 pb-2 pl-3 pr-3 text-sm no-underline  hover:bg-gray-100">
+    <article className="relative rounded-md border bg-white p-3 text-sm shadow-sm transition-colors hover:bg-gray-100/70">
       <Link
         href={`/thread/${thread.id}`}
         prefetch={false}
-        className="absolute inset-0 z-10 no-underline text-inherit"
+        className="absolute inset-0 no-underline text-inherit"
       />
 
-      <div className="flex items-center gap-3">
+      <div className={`flex items-start ${show_avatar ? "gap-3" : "gap-0"}`}>
         {user_link ? (
           <>
+            {show_avatar && (
+              <Link
+                href={authorHref}
+                prefetch={false}
+                className="relative mt-0.5 text-inherit no-underline"
+              >
+                {renderAvatar(thread.author_avatar)}
+              </Link>
+            )}
             <Link
-              href={`/user/${thread.author_id}?ts=${Date.now()}`}
+              href={authorHref}
               prefetch={false}
-              className="relative z-30 text-inherit no-underline"
+              className="relative text-inherit no-underline"
             >
-              {renderAvatar(thread.author_avatar)}
-            </Link>
-            <Link
-              href={`/user/${thread.author_id}?ts=${Date.now()}`}
-              prefetch={false}
-              className="relative z-30 text-inherit no-underline"
-            >
-              <div>{thread.author_name}</div>
-              <div>
-                posted at {formatUnix(thread.created_at)}
+              {show_author_name && (
+                <div className="font-medium text-gray-900">
+                  {thread.author_name || "Unknown"}
+                </div>
+              )}
+              <div className="text-xs text-gray-500">
+                {formatUnix(thread.created_at)}
                 {show_forum_name ? " in " + thread.forum_name : ""}
               </div>
             </Link>
           </>
         ) : (
           <>
+            {show_avatar && (
+              <span className="mt-0.5 text-inherit no-underline">
+                {renderAvatar(thread.author_avatar)}
+              </span>
+            )}
             <span className="text-inherit no-underline">
-              {renderAvatar(thread.author_avatar)}
-            </span>
-            <span className="text-inherit no-underline">
-              <div>{thread.author_name}</div>
-              <div>
-                posted at {formatUnix(thread.created_at)}
+              {show_author_name && (
+                <div className="font-medium text-gray-900">
+                  {thread.author_name || "Unknown"}
+                </div>
+              )}
+              <div className="text-xs text-gray-500">
+                {formatUnix(thread.created_at)}
                 {show_forum_name ? " in " + thread.forum_name : ""}
               </div>
             </span>
@@ -60,13 +78,15 @@ export default function ThreadCard({
         )}
       </div>
 
-      <div className="relative z-20 pointer-events-none space-y-1">
-        {thread.title}
+      <div className="mt-2 space-y-2">
+        <h3 className="text-sm leading-snug font-semibold text-gray-900">
+          {thread.title || `Thread ${thread.id}`}
+        </h3>
         {renderThreadSummary(thread.content)}
         {createPoll(thread.content)}
         <StatsBar upvote_num={thread.agree} reply_num={thread.reply_num} />
       </div>
-    </div>
+    </article>
   );
 }
 
@@ -78,18 +98,18 @@ export function StatsBar({
   reply_num: number;
 }) {
   return (
-    <div className="flex items-center gap-3 text-gray-500">
+    <div className="flex items-center gap-2 text-gray-500">
       {/* vote */}
-      <div className="flex items-center gap-2 rounded-lg border px-3 py-1">
-        <ArrowUp className="h-4 w-4 cursor-pointer" />
-        <span className="text-sm font-medium">{upvote_num}</span>
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1">
+        <ArrowUp className="h-4 w-4" />
+        <span className="text-sm font-medium text-gray-700">{upvote_num}</span>
         {/* <ArrowDown className="h-4 w-4 cursor-pointer" /> */}
       </div>
 
       {/* comment */}
-      <div className="flex items-center gap-2 rounded-lg border px-3 py-1">
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1">
         <MessageCircle className="h-4 w-4" />
-        <span className="text-sm font-medium">{reply_num}</span>
+        <span className="text-sm font-medium text-gray-700">{reply_num}</span>
       </div>
     </div>
   );
@@ -108,7 +128,7 @@ type PollProps = {
 };
 
 export function createPoll(thread_content: string) {
-  let xml = thread_content.trim();
+  const xml = thread_content.trim();
   const parser = new DOMParser();
   const doc = parser.parseFromString(xml, "text/xml");
   const votes = doc.getElementsByTagName("VoteInfo");

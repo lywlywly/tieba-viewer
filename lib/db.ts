@@ -41,6 +41,14 @@ export interface UserInfo {
   avatar_large_hash: string;
 }
 
+interface AuthoredRecord {
+  created_at: number;
+  content: string;
+  author_id: number;
+  author_name: string | null;
+  author_avatar: string | null;
+}
+
 export function getUserInfo(uid: number): UserInfo {
   const db = getDb();
 
@@ -67,17 +75,12 @@ export function getUserInfo(uid: number): UserInfo {
   return row;
 }
 
-export interface ThreadRow {
+export interface ThreadRow extends AuthoredRecord {
   id: number;
   title: string;
-  content: string;
-  author_id: number;
-  created_at: number;
   updated_at: number;
   forum_id: number;
   forum_name: string;
-  author_name: string | null;
-  author_avatar: string | null;
   view_num: number;
   reply_num: number;
   share_num: number;
@@ -85,117 +88,262 @@ export interface ThreadRow {
   disagree: number;
 }
 
+const THREAD_ROW_SELECT = `
+  SELECT
+    t.tid AS id,
+    t.title,
+    t.content,
+    t.author_id,
+    t.time AS created_at,
+    t.updated_time AS updated_at,
+    t.forum_id,
+    f.forum_name,
+    COALESCE(up.nickname, up.username) AS author_name,
+    i.avatar_large_hash AS author_avatar,
+    t.view_num,
+    t.reply_num,
+    t.share_num,
+    t.agree,
+    t.disagree
+  FROM thread t
+  LEFT JOIN forum f
+    ON f.fid = t.forum_id
+  LEFT JOIN user u
+    ON u.uid = t.author_id
+  LEFT JOIN user_profile up
+    ON up.id = u.current_profile_id
+  LEFT JOIN image i
+    ON up.portrait_id = i.id
+`;
+
 export function getThreads(
   limit: number,
   forum_name?: string,
   order?: string,
 ): ThreadRow[] {
   const db = getDb();
+  const forumFilter = forum_name?.trim() || "";
+  const orderMode = order === "Create" ? "Create" : "Reply";
 
-  const joinClause = forum_name ? `AND f.forum_name = '${forum_name}'` : "";
+  if (!forumFilter) {
+    const stmt = db.prepare<[string, number], ThreadRow>(`
+      ${THREAD_ROW_SELECT}
+      ORDER BY
+        CASE WHEN ? = 'Create' THEN t.time ELSE t.updated_time END DESC
+      LIMIT ?
+    `);
+    return stmt.all(orderMode, limit);
+  }
 
-  const threadOrder = order === "Create" ? "created_at" : "updated_at";
-
-  const stmt = db.prepare<[number], ThreadRow>(`
-    SELECT
-      t.tid AS id,
-      t.title,
-      t.content,
-      t.author_id,
-      t.time AS created_at,
-      t.updated_time AS updated_at,
-      t.forum_id,
-      f.forum_name,
-      COALESCE(up.nickname, up.username) AS author_name,
-      i.avatar_large_hash AS author_avatar,
-      t.view_num,
-      t.reply_num,
-      t.share_num,
-      t.agree,
-      t.disagree
-    FROM thread t
-    JOIN forum f
-      ON f.fid = t.forum_id ${joinClause}
-    LEFT JOIN user u
-      ON u.uid = t.author_id
-    LEFT JOIN user_profile up
-      ON up.id = u.current_profile_id
-    LEFT JOIN image i
-      ON up.portrait_id = i.id
-    ORDER BY ${threadOrder} DESC
+  const stmt = db.prepare<[string, string, number], ThreadRow>(`
+    ${THREAD_ROW_SELECT}
+    WHERE f.forum_name = ?
+    ORDER BY
+      CASE WHEN ? = 'Create' THEN t.time ELSE t.updated_time END DESC
     LIMIT ?
   `);
-
-  return stmt.all(limit);
+  return stmt.all(forumFilter, orderMode, limit);
 }
 
 export function getUserThreads(uid: number, limit: number): ThreadRow[] {
   const db = getDb();
 
   const stmt = db.prepare<[number, number], ThreadRow>(`
-    SELECT
-      t.tid AS id,
-      t.title,
-      t.content,
-      t.author_id,
-      t.time AS created_at,
-      t.updated_time AS updated_at,
-      t.forum_id,
-      f.forum_name,
-      COALESCE(up.nickname, up.username) AS author_name,
-      i.avatar_large_hash AS author_avatar,
-      t.view_num,
-      t.reply_num,
-      t.share_num,
-      t.agree,
-      t.disagree
-    FROM thread t
-    LEFT JOIN forum f
-      ON f.fid = t.forum_id
-    LEFT JOIN user u
-      ON u.uid = t.author_id
-    LEFT JOIN user_profile up
-      ON up.id = u.current_profile_id
-    LEFT JOIN image i
-      ON up.portrait_id = i.id
+    ${THREAD_ROW_SELECT}
     WHERE t.author_id = ?
-    ORDER BY created_at DESC
+    ORDER BY t.time DESC
     LIMIT ?
   `);
 
   return stmt.all(uid, limit);
 }
 
-export interface PostRow {
-  id: number;
-  thread_id: number;
-  content: string;
-  author_id: number;
-  created_at: number;
-  floor: number;
-  author_name: string | null;
-  author_avatar: string | null;
+export type UserActivityKind = "thread" | "post" | "comment";
+
+interface UserActivityContext extends Pick<
+  ThreadRow,
+  "created_at" | "author_id" | "forum_name"
+> {
+  thread_id: ThreadRow["id"];
+  thread_title: ThreadRow["title"];
 }
 
-export interface CommentRow {
+export interface UserThreadActivity
+  extends
+    UserActivityContext,
+    Pick<ThreadRow, "reply_num" | "agree" | "disagree"> {
+  kind: "thread";
+  thread_content: ThreadRow["content"];
+}
+
+export interface UserPostActivity extends UserActivityContext {
+  kind: "post";
+  content: ThreadRow["content"];
+  post_id: PostRow["id"];
+  floor: PostRow["floor"];
+}
+
+export interface UserCommentActivity extends UserActivityContext {
+  kind: "comment";
+  content: ThreadRow["content"];
+  post_id: PostRow["id"];
+  comment_id: CommentRow["id"];
+  post_floor: PostRow["floor"];
+  reply_to_author_name: CommentRow["reply_to_author_name"];
+}
+
+export type UserCommentFeedItem = UserPostActivity | UserCommentActivity;
+
+export type UserOverviewItem =
+  | UserThreadActivity
+  | UserPostActivity
+  | UserCommentActivity;
+
+function sortAndLimitByCreatedAt<T extends { created_at: number }>(
+  rows: T[],
+  limit: number,
+): T[] {
+  return rows.sort((a, b) => b.created_at - a.created_at).slice(0, limit);
+}
+
+function queryUserThreadActivities(
+  uid: number,
+  limit: number,
+): UserThreadActivity[] {
+  const db = getDb();
+
+  return db
+    .prepare<[number, number], UserThreadActivity>(
+      `
+      SELECT
+        'thread' AS kind,
+        t.time AS created_at,
+        t.author_id AS author_id,
+        t.tid AS thread_id,
+        t.title AS thread_title,
+        f.forum_name AS forum_name,
+        t.content AS thread_content,
+        t.reply_num AS reply_num,
+        t.agree AS agree,
+        t.disagree AS disagree
+      FROM thread t
+      LEFT JOIN forum f
+        ON f.fid = t.forum_id
+      WHERE t.author_id = ?
+      ORDER BY t.time DESC
+      LIMIT ?
+    `,
+    )
+    .all(uid, limit);
+}
+
+function queryUserPostActivities(
+  uid: number,
+  limit: number,
+): UserPostActivity[] {
+  const db = getDb();
+
+  return db
+    .prepare<[number, number], UserPostActivity>(
+      `
+      SELECT
+        'post' AS kind,
+        p.time AS created_at,
+        p.author_id AS author_id,
+        t.tid AS thread_id,
+        t.title AS thread_title,
+        f.forum_name AS forum_name,
+        p.content AS content,
+        p.pid AS post_id,
+        p.floor AS floor
+      FROM post p
+      JOIN thread t
+        ON t.tid = p.tid
+      LEFT JOIN forum f
+        ON f.fid = t.forum_id
+      WHERE p.author_id = ?
+      ORDER BY p.time DESC, p.pid DESC
+      LIMIT ?
+    `,
+    )
+    .all(uid, limit);
+}
+
+function queryUserCommentActivities(
+  uid: number,
+  limit: number,
+): UserCommentActivity[] {
+  const db = getDb();
+
+  return db
+    .prepare<[number, number], UserCommentActivity>(
+      `
+      SELECT
+        'comment' AS kind,
+        c.time AS created_at,
+        c.author_id AS author_id,
+        t.tid AS thread_id,
+        t.title AS thread_title,
+        f.forum_name AS forum_name,
+        c.content AS content,
+        p.pid AS post_id,
+        c.cid AS comment_id,
+        p.floor AS post_floor,
+        COALESCE(up2.nickname, up2.username) AS reply_to_author_name
+      FROM comment c
+      JOIN post p
+        ON p.pid = c.pid
+      JOIN thread t
+        ON t.tid = p.tid
+      LEFT JOIN forum f
+        ON f.fid = t.forum_id
+      LEFT JOIN user u2
+        ON u2.uid = c.reply_to
+      LEFT JOIN user_profile up2
+        ON up2.id = u2.current_profile_id
+       AND c.reply_to <> 0
+      WHERE c.author_id = ?
+      ORDER BY c.time DESC, c.cid DESC
+      LIMIT ?
+    `,
+    )
+    .all(uid, limit);
+}
+
+export function getUserPostAndCommentActivities(
+  uid: number,
+  limit: number,
+): UserCommentFeedItem[] {
+  const posts = queryUserPostActivities(uid, limit);
+  const comments = queryUserCommentActivities(uid, limit);
+  return sortAndLimitByCreatedAt([...posts, ...comments], limit);
+}
+
+export function getUserOverviewActivities(
+  uid: number,
+  limit: number,
+): UserOverviewItem[] {
+  const threads = queryUserThreadActivities(uid, limit);
+  const posts = queryUserPostActivities(uid, limit);
+  const comments = queryUserCommentActivities(uid, limit);
+  return sortAndLimitByCreatedAt([...threads, ...posts, ...comments], limit);
+}
+
+export interface PostRow extends AuthoredRecord {
+  id: number;
+  thread_id: number;
+  floor: number;
+}
+
+export interface CommentRow extends AuthoredRecord {
   id: number;
   post_id: number;
-  content: string;
-  author_id: number;
-  created_at: number;
   reply_to: number;
   reply_to_author_name: string | null;
-  author_name: string | null;
-  author_avatar: string | null;
 }
 
 export interface PostWithComments extends PostRow {
   comments: CommentRow[];
-}
-
-export interface ThreadData {
-  thread: ThreadRow;
-  posts: PostWithComments[];
 }
 
 export interface ThreadChunkData {
@@ -430,74 +578,13 @@ export function getThreadWithPostsAndCommentsByFloor(
   };
 }
 
-export function getThreadWithPostsAndCommentsForward(
-  threadId: number,
-  floor: number,
-  limit: number = 50,
-): ThreadChunkData | null {
-  return getThreadWithPostsAndCommentsByFloor(threadId, floor, limit, "after");
-}
-
-export function getThreadWithPostsAndCommentsBackward(
-  threadId: number,
-  floor: number,
-  limit: number = 50,
-): ThreadChunkData | null {
-  return getThreadWithPostsAndCommentsByFloor(threadId, floor, limit, "before");
-}
-
-export interface ThreadSearchResult {
-  id: number; // thread.tid
-  title: string;
-  content: string;
-  created_at: number;
-  forum_name: string;
-  author_name: string | null;
-}
-
-export function searchThreadsByKeyword(
-  keyword: string,
-  limit = 50,
-): ThreadSearchResult[] {
-  const db = getDb();
-  const term = `%${keyword}%`;
-
-  const stmt = db.prepare<[string, string, number], ThreadSearchResult>(`
-    SELECT
-      t.tid AS id,
-      t.title AS title,
-      t.content AS content,
-      t.time AS created_at,
-      f.forum_name AS forum_name,
-      COALESCE(up.nickname, up.username) AS author_name
-    FROM thread t
-    LEFT JOIN forum f
-      ON f.fid = t.forum_id
-    LEFT JOIN user u
-      ON u.uid = t.author_id
-    LEFT JOIN user_profile up
-      ON up.id = u.current_profile_id
-    WHERE t.title LIKE ? OR t.content LIKE ?
-    ORDER BY t.updated_time DESC
-    LIMIT ?
-  `);
-
-  return stmt.all(term, term, limit);
-}
-
-export interface ThreadSearchWithCounts {
-  id: number; // thread.tid
-  title: string;
-  content: string;
-  created_at: number;
-  forum_name: string;
-  author_name: string | null;
-
+export interface ThreadSearchWithCounts extends Pick<
+  ThreadRow,
+  "id" | "title" | "content" | "created_at" | "forum_name" | "author_name"
+> {
   thread_match: boolean;
   post_match_count: number;
   comment_match_count: number;
-
-  // NEW: sample content from first matching post/comment in this thread
   post_match_sample_content: string | null;
   comment_match_sample_content: string | null;
 }
@@ -526,21 +613,32 @@ export function searchThreadsWithKeywordAndScopes(
     { count: number; firstCid: number }
   >();
 
-  // 1) Threads where title/content matches
-  let joinClause = forum_name
-    ? `JOIN forum f ON t.forum_id = f.fid AND f.forum_name = '${forum_name}'`
-    : "";
+  const forumFilter = forum_name.trim();
 
-  const threadRows = db
-    .prepare<[string, string], { tid: number }>(
-      `
-      SELECT t.tid AS tid
-      FROM thread t
-      ${joinClause}
-      WHERE t.title LIKE ? OR t.content LIKE ?
-    `,
-    )
-    .all(likeTerm, likeTerm);
+  // 1) Threads where title/content matches
+
+  const threadRows = forumFilter
+    ? db
+        .prepare<[string, string, string], { tid: number }>(
+          `
+          SELECT t.tid AS tid
+          FROM thread t
+          JOIN forum f
+            ON t.forum_id = f.fid
+          WHERE (t.title LIKE ? OR t.content LIKE ?)
+            AND f.forum_name = ?
+        `,
+        )
+        .all(likeTerm, likeTerm, forumFilter)
+    : db
+        .prepare<[string, string], { tid: number }>(
+          `
+          SELECT t.tid AS tid
+          FROM thread t
+          WHERE t.title LIKE ? OR t.content LIKE ?
+        `,
+        )
+        .all(likeTerm, likeTerm);
 
   for (const row of threadRows) {
     threadMatches.add(row.tid);
@@ -548,23 +646,39 @@ export function searchThreadsWithKeywordAndScopes(
 
   // 2) Posts where content matches (grouped by tid, with first matching pid)
   if (includePosts) {
-    joinClause = forum_name
-      ? `JOIN thread t on t.tid = p.tid JOIN forum f ON t.forum_id = f.fid AND f.forum_name = '${forum_name}'`
-      : "";
-
-    const rows = db
-      .prepare<[string], { tid: number; cnt: number; first_pid: number }>(
-        `
-        SELECT p.tid AS tid,
-               COUNT(*) AS cnt,
-               MIN(p.pid) AS first_pid
-        FROM post p
-        ${joinClause}
-        WHERE p.content LIKE ?
-        GROUP BY p.tid
-      `,
-      )
-      .all(likeTerm);
+    const rows = forumFilter
+      ? db
+          .prepare<
+            [string, string],
+            { tid: number; cnt: number; first_pid: number }
+          >(
+            `
+            SELECT p.tid AS tid,
+                   COUNT(*) AS cnt,
+                   MIN(p.pid) AS first_pid
+            FROM post p
+            JOIN thread t
+              ON t.tid = p.tid
+            JOIN forum f
+              ON t.forum_id = f.fid
+            WHERE p.content LIKE ?
+              AND f.forum_name = ?
+            GROUP BY p.tid
+          `,
+          )
+          .all(likeTerm, forumFilter)
+      : db
+          .prepare<[string], { tid: number; cnt: number; first_pid: number }>(
+            `
+            SELECT p.tid AS tid,
+                   COUNT(*) AS cnt,
+                   MIN(p.pid) AS first_pid
+            FROM post p
+            WHERE p.content LIKE ?
+            GROUP BY p.tid
+          `,
+          )
+          .all(likeTerm);
 
     for (const r of rows) {
       postMatchCounts.set(r.tid, { count: r.cnt, firstPid: r.first_pid });
@@ -573,24 +687,41 @@ export function searchThreadsWithKeywordAndScopes(
 
   // 3) Comments where content matches (grouped by tid via post, with first cid)
   if (includeComments) {
-    joinClause = forum_name
-      ? `JOIN thread t on t.tid = p.tid JOIN forum f ON t.forum_id = f.fid AND f.forum_name = '${forum_name}'`
-      : "";
-
-    const rows = db
-      .prepare<[string], { tid: number; cnt: number; first_cid: number }>(
-        `
-        SELECT p.tid AS tid,
-               COUNT(*) AS cnt,
-               MIN(c.cid) AS first_cid
-        FROM comment c
-        JOIN post p ON p.pid = c.pid
-        ${joinClause}
-        WHERE c.content LIKE ?
-        GROUP BY p.tid
-      `,
-      )
-      .all(likeTerm);
+    const rows = forumFilter
+      ? db
+          .prepare<
+            [string, string],
+            { tid: number; cnt: number; first_cid: number }
+          >(
+            `
+            SELECT p.tid AS tid,
+                   COUNT(*) AS cnt,
+                   MIN(c.cid) AS first_cid
+            FROM comment c
+            JOIN post p ON p.pid = c.pid
+            JOIN thread t
+              ON t.tid = p.tid
+            JOIN forum f
+              ON t.forum_id = f.fid
+            WHERE c.content LIKE ?
+              AND f.forum_name = ?
+            GROUP BY p.tid
+          `,
+          )
+          .all(likeTerm, forumFilter)
+      : db
+          .prepare<[string], { tid: number; cnt: number; first_cid: number }>(
+            `
+            SELECT p.tid AS tid,
+                   COUNT(*) AS cnt,
+                   MIN(c.cid) AS first_cid
+            FROM comment c
+            JOIN post p ON p.pid = c.pid
+            WHERE c.content LIKE ?
+            GROUP BY p.tid
+          `,
+          )
+          .all(likeTerm);
 
     for (const r of rows) {
       commentMatchCounts.set(r.tid, {
@@ -730,5 +861,17 @@ export function searchThreadsWithKeywordAndScopes(
   // 9) Sort by updated_time desc and apply limit
   results.sort((a, b) => b.updated_at - a.updated_at);
 
-  return results.slice(0, limit).map(({ updated_at, ...rest }) => rest);
+  return results.slice(0, limit).map((row) => ({
+    id: row.id,
+    title: row.title,
+    content: row.content,
+    created_at: row.created_at,
+    forum_name: row.forum_name,
+    author_name: row.author_name,
+    thread_match: row.thread_match,
+    post_match_count: row.post_match_count,
+    comment_match_count: row.comment_match_count,
+    post_match_sample_content: row.post_match_sample_content,
+    comment_match_sample_content: row.comment_match_sample_content,
+  }));
 }
