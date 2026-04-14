@@ -437,7 +437,6 @@ async function queryUserCommentActivities(
         ON u2.uid = c.reply_to
       LEFT JOIN user_profile up2
         ON up2.id = u2.current_profile_id
-        AND c.reply_to <> 0
       WHERE c.author_id = ?
       ORDER BY c.time DESC, c.cid DESC
       LIMIT ?
@@ -480,7 +479,7 @@ export interface PostRow extends AuthoredRecord {
 export interface CommentRow extends AuthoredRecord {
   id: number;
   post_id: number;
-  reply_to: number;
+  reply_to: number | null;
   reply_to_author_name: string | null;
 }
 
@@ -565,7 +564,6 @@ async function getCommentsByPostIds(
       ON u2.uid = c.reply_to
     LEFT JOIN user_profile up2
       ON up2.id = u2.current_profile_id
-      AND c.reply_to <> 0
     WHERE c.pid IN (${placeholders})
     ORDER BY c.time ASC, c.cid ASC
   `,

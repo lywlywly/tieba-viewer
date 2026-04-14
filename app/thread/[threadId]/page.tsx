@@ -214,7 +214,7 @@ function PostCard({ post, index }: { post: PostWithComments; index: number }) {
                   )}
                 </div>
                 <div className="text text-xs text-gray-800 whitespace-pre-wrap wrap-break-word">
-                  {c.reply_to != 0
+                  {c.reply_to != null
                     ? `reply to ${c.reply_to_author_name}: `
                     : ""}
                   {renderTiebaContent(c.content)}
