@@ -13,8 +13,11 @@ export default async function Page({
   const { name, order } = await searchParams;
   const sortOrder: Order = order === "Create" ? "Create" : "Reply";
 
-  const threads = getThreads(50, name, order);
-  const options = getForumNames().map((e) => e.name);
+  const [threads, forumOptions] = await Promise.all([
+    getThreads(50, name, order),
+    getForumNames(),
+  ]);
+  const options = forumOptions.map((e) => e.name);
 
   return (
     <div className="mx-auto w-full min-w-100 max-w-200 pt-2 space-y-3">

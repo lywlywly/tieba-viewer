@@ -24,7 +24,7 @@ export default async function SearchPage({ searchParams }: SearchPageProps) {
   let results: ThreadSearchWithCounts[] = [];
 
   if (keyword) {
-    results = searchThreadsWithKeywordAndScopes(
+    results = await searchThreadsWithKeywordAndScopes(
       keyword,
       includePosts,
       includeComments,

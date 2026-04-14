@@ -44,21 +44,22 @@ export default async function UserPage({
   const parsedUserId = Number(userId);
   let userInfo;
   try {
-    userInfo = getUserInfo(parsedUserId);
+    userInfo = await getUserInfo(parsedUserId);
   } catch {
     notFound();
   }
 
-  const threads =
-    tab === "threads" ? getUserThreads(parsedUserId, USER_ACTIVITY_LIMIT) : [];
-  const commentFeed =
+  const [threads, commentFeed, overview] = await Promise.all([
+    tab === "threads"
+      ? getUserThreads(parsedUserId, USER_ACTIVITY_LIMIT)
+      : Promise.resolve([]),
     tab === "comments"
       ? getUserPostAndCommentActivities(parsedUserId, USER_ACTIVITY_LIMIT)
-      : [];
-  const overview =
+      : Promise.resolve([]),
     tab === "overview"
       ? getUserOverviewActivities(parsedUserId, USER_ACTIVITY_LIMIT)
-      : [];
+      : Promise.resolve([]),
+  ]);
   return (
     <div className="mx-auto w-full min-w-100 max-w-200 space-y-4 pt-2">
       <section className="flex min-w-0 items-center gap-3 px-1 pt-1">

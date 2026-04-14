@@ -2,33 +2,174 @@ import path from "path";
 import Database from "better-sqlite3";
 import assert from "assert";
 
-let db: Database.Database | null = null;
+type QueryParam = string | number | boolean | null;
 
-export function getDb(): Database.Database {
-  if (!db) {
+const DB_DRIVER = (process.env.DB_DRIVER ?? "sqlite").toLowerCase();
+const IS_POSTGRES = DB_DRIVER === "postgres" || DB_DRIVER === "pg";
+
+let sqliteDb: Database.Database | null = null;
+let pgPoolPromise: Promise<{
+  query: (sql: string, values?: QueryParam[]) => Promise<{ rows: unknown[] }>;
+}> | null = null;
+
+function getSqliteDb(): Database.Database {
+  if (!sqliteDb) {
     const dbPath = path.join(process.env.DB_PATH!);
-    db = new Database(dbPath, { readonly: true });
+    sqliteDb = new Database(dbPath, { readonly: true });
   }
-  return db;
+  return sqliteDb;
+}
+
+async function getPgPool() {
+  if (!pgPoolPromise) {
+    pgPoolPromise = (async () => {
+      const dynamicImport = new Function("m", "return import(m)") as (
+        m: string,
+      ) => Promise<{
+        Pool: new (...args: unknown[]) => {
+          query: (
+            sql: string,
+            values?: QueryParam[],
+          ) => Promise<{ rows: unknown[] }>;
+        };
+      }>;
+
+      const { Pool } = await dynamicImport("pg");
+      const connectionString = process.env.DATABASE_URL;
+      assert(
+        connectionString,
+        "DATABASE_URL is required when DB_DRIVER=postgres",
+      );
+      return new Pool({ connectionString });
+    })();
+  }
+
+  return pgPoolPromise;
+}
+
+function convertQMarkToPg(sql: string): string {
+  let out = "";
+  let index = 1;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    const next = i + 1 < sql.length ? sql[i + 1] : "";
+
+    if (inLineComment) {
+      out += ch;
+      if (ch === "\n") {
+        inLineComment = false;
+      }
+      continue;
+    }
+
+    if (inBlockComment) {
+      out += ch;
+      if (ch === "*" && next === "/") {
+        out += next;
+        i++;
+        inBlockComment = false;
+      }
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      if (ch === "-" && next === "-") {
+        out += ch + next;
+        i++;
+        inLineComment = true;
+        continue;
+      }
+      if (ch === "/" && next === "*") {
+        out += ch + next;
+        i++;
+        inBlockComment = true;
+        continue;
+      }
+    }
+
+    if (!inDoubleQuote && ch === "'") {
+      out += ch;
+      if (next === "'") {
+        out += next;
+        i++;
+      } else {
+        inSingleQuote = !inSingleQuote;
+      }
+      continue;
+    }
+
+    if (!inSingleQuote && ch === '"') {
+      out += ch;
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote && ch === "?") {
+      out += `$${index}`;
+      index += 1;
+      continue;
+    }
+
+    out += ch;
+  }
+
+  return out;
+}
+
+async function queryAll<T>(
+  sql: string,
+  params: QueryParam[] = [],
+): Promise<T[]> {
+  if (IS_POSTGRES) {
+    const pool = await getPgPool();
+    const pgSql = convertQMarkToPg(sql);
+    const result = await pool.query(pgSql, params);
+    return result.rows as T[];
+  }
+
+  const db = getSqliteDb();
+  return db.prepare<QueryParam[], T>(sql).all(...params);
+}
+
+async function queryOne<T>(
+  sql: string,
+  params: QueryParam[] = [],
+): Promise<T | undefined> {
+  if (IS_POSTGRES) {
+    const rows = await queryAll<T>(`${sql}\nLIMIT 1`, params);
+    return rows[0];
+  }
+
+  const db = getSqliteDb();
+  return db.prepare<QueryParam[], T>(sql).get(...params);
+}
+
+function flagToBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") {
+    const lower = value.toLowerCase();
+    return lower === "1" || lower === "true" || lower === "t";
+  }
+  return false;
 }
 
 export interface ForumOption {
   name: string;
 }
 
-export function getForumNames(): ForumOption[] {
-  const db = getDb();
-
-  const stmt = db.prepare<[], ForumOption>(`
+export async function getForumNames(): Promise<ForumOption[]> {
+  return queryAll<ForumOption>(`
     SELECT
       forum_name as name
     FROM
       forum
   `);
-
-  const row = stmt.all();
-
-  return row;
 }
 
 export interface UserInfo {
@@ -49,10 +190,9 @@ interface AuthoredRecord {
   author_avatar: string | null;
 }
 
-export function getUserInfo(uid: number): UserInfo {
-  const db = getDb();
-
-  const stmt = db.prepare<[number], UserInfo>(`
+export async function getUserInfo(uid: number): Promise<UserInfo> {
+  const row = await queryOne<UserInfo>(
+    `
     SELECT
       u.uid,
       up.changed_at,
@@ -61,17 +201,17 @@ export function getUserInfo(uid: number): UserInfo {
       u.portrait,
       i.avatar_small_hash,
       i.avatar_large_hash
-    FROM user u
+    FROM "user" u
     LEFT JOIN user_profile up
       ON up.id = u.current_profile_id
     LEFT JOIN image i
       ON up.portrait_id = i.id
     WHERE u.uid = ?
-  `);
+  `,
+    [uid],
+  );
 
-  const row = stmt.get(uid);
   assert(row);
-
   return row;
 }
 
@@ -108,7 +248,7 @@ const THREAD_ROW_SELECT = `
   FROM thread t
   LEFT JOIN forum f
     ON f.fid = t.forum_id
-  LEFT JOIN user u
+  LEFT JOIN "user" u
     ON u.uid = t.author_id
   LEFT JOIN user_profile up
     ON up.id = u.current_profile_id
@@ -116,46 +256,51 @@ const THREAD_ROW_SELECT = `
     ON up.portrait_id = i.id
 `;
 
-export function getThreads(
+export async function getThreads(
   limit: number,
   forum_name?: string,
   order?: string,
-): ThreadRow[] {
-  const db = getDb();
+): Promise<ThreadRow[]> {
   const forumFilter = forum_name?.trim() || "";
   const orderMode = order === "Create" ? "Create" : "Reply";
 
   if (!forumFilter) {
-    const stmt = db.prepare<[string, number], ThreadRow>(`
+    return queryAll<ThreadRow>(
+      `
       ${THREAD_ROW_SELECT}
       ORDER BY
         CASE WHEN ? = 'Create' THEN t.time ELSE t.updated_time END DESC
       LIMIT ?
-    `);
-    return stmt.all(orderMode, limit);
+    `,
+      [orderMode, limit],
+    );
   }
 
-  const stmt = db.prepare<[string, string, number], ThreadRow>(`
+  return queryAll<ThreadRow>(
+    `
     ${THREAD_ROW_SELECT}
     WHERE f.forum_name = ?
     ORDER BY
       CASE WHEN ? = 'Create' THEN t.time ELSE t.updated_time END DESC
     LIMIT ?
-  `);
-  return stmt.all(forumFilter, orderMode, limit);
+  `,
+    [forumFilter, orderMode, limit],
+  );
 }
 
-export function getUserThreads(uid: number, limit: number): ThreadRow[] {
-  const db = getDb();
-
-  const stmt = db.prepare<[number, number], ThreadRow>(`
+export async function getUserThreads(
+  uid: number,
+  limit: number,
+): Promise<ThreadRow[]> {
+  return queryAll<ThreadRow>(
+    `
     ${THREAD_ROW_SELECT}
     WHERE t.author_id = ?
     ORDER BY t.time DESC
     LIMIT ?
-  `);
-
-  return stmt.all(uid, limit);
+  `,
+    [uid, limit],
+  );
 }
 
 export type UserActivityKind = "thread" | "post" | "comment";
@@ -206,15 +351,12 @@ function sortAndLimitByCreatedAt<T extends { created_at: number }>(
   return rows.sort((a, b) => b.created_at - a.created_at).slice(0, limit);
 }
 
-function queryUserThreadActivities(
+async function queryUserThreadActivities(
   uid: number,
   limit: number,
-): UserThreadActivity[] {
-  const db = getDb();
-
-  return db
-    .prepare<[number, number], UserThreadActivity>(
-      `
+): Promise<UserThreadActivity[]> {
+  return queryAll<UserThreadActivity>(
+    `
       SELECT
         'thread' AS kind,
         t.time AS created_at,
@@ -233,19 +375,16 @@ function queryUserThreadActivities(
       ORDER BY t.time DESC
       LIMIT ?
     `,
-    )
-    .all(uid, limit);
+    [uid, limit],
+  );
 }
 
-function queryUserPostActivities(
+async function queryUserPostActivities(
   uid: number,
   limit: number,
-): UserPostActivity[] {
-  const db = getDb();
-
-  return db
-    .prepare<[number, number], UserPostActivity>(
-      `
+): Promise<UserPostActivity[]> {
+  return queryAll<UserPostActivity>(
+    `
       SELECT
         'post' AS kind,
         p.time AS created_at,
@@ -265,19 +404,16 @@ function queryUserPostActivities(
       ORDER BY p.time DESC, p.pid DESC
       LIMIT ?
     `,
-    )
-    .all(uid, limit);
+    [uid, limit],
+  );
 }
 
-function queryUserCommentActivities(
+async function queryUserCommentActivities(
   uid: number,
   limit: number,
-): UserCommentActivity[] {
-  const db = getDb();
-
-  return db
-    .prepare<[number, number], UserCommentActivity>(
-      `
+): Promise<UserCommentActivity[]> {
+  return queryAll<UserCommentActivity>(
+    `
       SELECT
         'comment' AS kind,
         c.time AS created_at,
@@ -297,35 +433,41 @@ function queryUserCommentActivities(
         ON t.tid = p.tid
       LEFT JOIN forum f
         ON f.fid = t.forum_id
-      LEFT JOIN user u2
+      LEFT JOIN "user" u2
         ON u2.uid = c.reply_to
       LEFT JOIN user_profile up2
         ON up2.id = u2.current_profile_id
-       AND c.reply_to <> 0
+        AND c.reply_to <> 0
       WHERE c.author_id = ?
       ORDER BY c.time DESC, c.cid DESC
       LIMIT ?
     `,
-    )
-    .all(uid, limit);
+    [uid, limit],
+  );
 }
 
-export function getUserPostAndCommentActivities(
+export async function getUserPostAndCommentActivities(
   uid: number,
   limit: number,
-): UserCommentFeedItem[] {
-  const posts = queryUserPostActivities(uid, limit);
-  const comments = queryUserCommentActivities(uid, limit);
+): Promise<UserCommentFeedItem[]> {
+  const [posts, comments] = await Promise.all([
+    queryUserPostActivities(uid, limit),
+    queryUserCommentActivities(uid, limit),
+  ]);
+
   return sortAndLimitByCreatedAt([...posts, ...comments], limit);
 }
 
-export function getUserOverviewActivities(
+export async function getUserOverviewActivities(
   uid: number,
   limit: number,
-): UserOverviewItem[] {
-  const threads = queryUserThreadActivities(uid, limit);
-  const posts = queryUserPostActivities(uid, limit);
-  const comments = queryUserCommentActivities(uid, limit);
+): Promise<UserOverviewItem[]> {
+  const [threads, posts, comments] = await Promise.all([
+    queryUserThreadActivities(uid, limit),
+    queryUserPostActivities(uid, limit),
+    queryUserCommentActivities(uid, limit),
+  ]);
+
   return sortAndLimitByCreatedAt([...threads, ...posts, ...comments], limit);
 }
 
@@ -357,10 +499,9 @@ export interface ThreadChunkData {
 
 export type ChunkMode = "start_at" | "after" | "before" | "last";
 
-function getThreadRow(threadId: number): ThreadRow | undefined {
-  const db = getDb();
-
-  const threadStmt = db.prepare<[number], ThreadRow>(`
+async function getThreadRow(threadId: number): Promise<ThreadRow | undefined> {
+  return queryOne<ThreadRow>(
+    `
     SELECT
       t.tid                AS id,
       t.title              AS title,
@@ -372,32 +513,37 @@ function getThreadRow(threadId: number): ThreadRow | undefined {
       f.forum_name         AS forum_name,
       t.reply_num          AS reply_num,
       COALESCE(up.nickname, up.username) AS author_name,
-      i.avatar_large_hash  AS author_avatar
+      i.avatar_large_hash  AS author_avatar,
+      t.view_num           AS view_num,
+      t.share_num          AS share_num,
+      t.agree              AS agree,
+      t.disagree           AS disagree
     FROM thread t
     LEFT JOIN forum f
       ON f.fid = t.forum_id
-    LEFT JOIN user u
+    LEFT JOIN "user" u
       ON u.uid = t.author_id
     LEFT JOIN user_profile up
       ON up.id = u.current_profile_id
     LEFT JOIN image i
       ON up.portrait_id = i.id
     WHERE t.tid = ?
-  `);
-
-  return threadStmt.get(threadId);
+  `,
+    [threadId],
+  );
 }
 
-function getCommentsByPostIds(postIds: number[]): Record<number, CommentRow[]> {
-  const db = getDb();
-
+async function getCommentsByPostIds(
+  postIds: number[],
+): Promise<Record<number, CommentRow[]>> {
   if (postIds.length === 0) {
     return {};
   }
 
   const placeholders = postIds.map(() => "?").join(",");
 
-  const commentsStmt = db.prepare<number[], CommentRow>(`
+  const comments = await queryAll<CommentRow>(
+    `
     SELECT
       c.cid               AS id,
       c.pid               AS post_id,
@@ -409,22 +555,22 @@ function getCommentsByPostIds(postIds: number[]): Record<number, CommentRow[]> {
       COALESCE(up2.nickname, up2.username) AS reply_to_author_name,
       i.avatar_large_hash AS author_avatar
     FROM comment c
-    LEFT JOIN user u1
+    LEFT JOIN "user" u1
       ON u1.uid = c.author_id
     LEFT JOIN user_profile up1
       ON up1.id = u1.current_profile_id
     LEFT JOIN image i
       ON up1.portrait_id = i.id
-    LEFT JOIN user u2
+    LEFT JOIN "user" u2
       ON u2.uid = c.reply_to
     LEFT JOIN user_profile up2
       ON up2.id = u2.current_profile_id
-     AND c.reply_to <> 0
+      AND c.reply_to <> 0
     WHERE c.pid IN (${placeholders})
     ORDER BY c.time ASC, c.cid ASC
-  `);
-
-  const comments = commentsStmt.all(...postIds);
+  `,
+    postIds,
+  );
 
   return comments.reduce<Record<number, CommentRow[]>>((acc, comment) => {
     if (!acc[comment.post_id]) {
@@ -435,21 +581,18 @@ function getCommentsByPostIds(postIds: number[]): Record<number, CommentRow[]> {
   }, {});
 }
 
-function getPostsChunk(
+async function getPostsChunk(
   threadId: number,
   floor: number,
   limit: number,
   mode: ChunkMode,
-): PostRow[] {
-  const db = getDb();
-
+): Promise<PostRow[]> {
   const normalizedFloor = Math.max(1, floor);
   const normalizedLimit = Math.max(1, limit);
 
   if (mode === "last") {
-    const postsDesc = db
-      .prepare<[number, number], PostRow>(
-        `
+    const postsDesc = await queryAll<PostRow>(
+      `
       SELECT
         p.pid               AS id,
         p.tid               AS thread_id,
@@ -460,7 +603,7 @@ function getPostsChunk(
         COALESCE(up.nickname, up.username) AS author_name,
         i.avatar_large_hash AS author_avatar
       FROM post p
-      LEFT JOIN user u
+      LEFT JOIN "user" u
         ON u.uid = p.author_id
       LEFT JOIN user_profile up
         ON up.id = u.current_profile_id
@@ -470,17 +613,17 @@ function getPostsChunk(
       ORDER BY p.floor DESC
       LIMIT ?
     `,
-      )
-      .all(threadId, normalizedLimit);
+      [threadId, normalizedLimit],
+    );
 
     return postsDesc.reverse();
   }
 
   const whereOp = mode === "start_at" ? ">=" : mode === "after" ? ">" : "<";
-
   const orderDir = mode === "before" ? "DESC" : "ASC";
 
-  const postsStmt = db.prepare<[number, number, number], PostRow>(`
+  const rows = await queryAll<PostRow>(
+    `
     SELECT
       p.pid               AS id,
       p.tid               AS thread_id,
@@ -491,7 +634,7 @@ function getPostsChunk(
       COALESCE(up.nickname, up.username) AS author_name,
       i.avatar_large_hash AS author_avatar
     FROM post p
-    LEFT JOIN user u
+    LEFT JOIN "user" u
       ON u.uid = p.author_id
     LEFT JOIN user_profile up
       ON up.id = u.current_profile_id
@@ -501,55 +644,63 @@ function getPostsChunk(
       AND p.floor ${whereOp} ?
     ORDER BY p.floor ${orderDir}
     LIMIT ?
-  `);
+  `,
+    [threadId, normalizedFloor, normalizedLimit],
+  );
 
-  const rows = postsStmt.all(threadId, normalizedFloor, normalizedLimit);
   return mode === "before" ? rows.reverse() : rows;
 }
 
-function hasPostBefore(threadId: number, floor: number): boolean {
-  const db = getDb();
-
-  const stmt = db.prepare<[number, number], { has: number }>(`
-    SELECT EXISTS(
+async function hasPostBefore(
+  threadId: number,
+  floor: number,
+): Promise<boolean> {
+  const row = await queryOne<{ has: unknown }>(
+    `
+    SELECT CASE WHEN EXISTS(
       SELECT 1
       FROM post p
       WHERE p.tid = ?
         AND p.floor < ?
-    ) AS has
-  `);
+    ) THEN 1 ELSE 0 END AS has
+  `,
+    [threadId, floor],
+  );
 
-  return stmt.get(threadId, floor)!.has === 1;
+  return flagToBoolean(row?.has);
 }
 
-function hasPostAfter(threadId: number, floor: number): boolean {
-  const db = getDb();
-
-  const stmt = db.prepare<[number, number], { has: number }>(`
-    SELECT EXISTS(
+async function hasPostAfter(threadId: number, floor: number): Promise<boolean> {
+  const row = await queryOne<{ has: unknown }>(
+    `
+    SELECT CASE WHEN EXISTS(
       SELECT 1
       FROM post p
       WHERE p.tid = ?
         AND p.floor > ?
-    ) AS has
-  `);
+    ) THEN 1 ELSE 0 END AS has
+  `,
+    [threadId, floor],
+  );
 
-  return stmt.get(threadId, floor)!.has === 1;
+  return flagToBoolean(row?.has);
 }
 
-export function getThreadWithPostsAndCommentsByFloor(
+export async function getThreadWithPostsAndCommentsByFloor(
   threadId: number,
   floor: number,
   limit: number = 50,
   mode: ChunkMode = "start_at",
-): ThreadChunkData | null {
-  const thread = getThreadRow(threadId);
+): Promise<ThreadChunkData | null> {
+  const thread = await getThreadRow(threadId);
   if (!thread) {
     return null;
   }
 
-  const posts = getPostsChunk(threadId, floor, limit, mode);
-  const commentsByPost = getCommentsByPostIds(posts.map((post) => post.id));
+  const posts = await getPostsChunk(threadId, floor, limit, mode);
+  const commentsByPost = await getCommentsByPostIds(
+    posts.map((post) => post.id),
+  );
 
   const postsWithComments: PostWithComments[] = posts.map((post) => ({
     ...post,
@@ -564,9 +715,9 @@ export function getThreadWithPostsAndCommentsByFloor(
       : null;
 
   const hasPrev =
-    firstFloor !== null ? hasPostBefore(threadId, firstFloor) : false;
+    firstFloor !== null ? await hasPostBefore(threadId, firstFloor) : false;
   const hasNext =
-    lastFloor !== null ? hasPostAfter(threadId, lastFloor) : false;
+    lastFloor !== null ? await hasPostAfter(threadId, lastFloor) : false;
 
   return {
     thread,
@@ -589,25 +740,22 @@ export interface ThreadSearchWithCounts extends Pick<
   comment_match_sample_content: string | null;
 }
 
-export function searchThreadsWithKeywordAndScopes(
+export async function searchThreadsWithKeywordAndScopes(
   keyword: string,
   includePosts: boolean,
   includeComments: boolean,
   forum_name: string,
   limit = 50,
-): ThreadSearchWithCounts[] {
-  const db = getDb();
+): Promise<ThreadSearchWithCounts[]> {
   const likeTerm = `%${keyword}%`;
 
   const threadMatches = new Set<number>();
 
-  // tid -> { count, firstPid }
   const postMatchCounts = new Map<
     number,
     { count: number; firstPid: number }
   >();
 
-  // tid -> { count, firstCid }
   const commentMatchCounts = new Map<
     number,
     { count: number; firstCid: number }
@@ -615,12 +763,9 @@ export function searchThreadsWithKeywordAndScopes(
 
   const forumFilter = forum_name.trim();
 
-  // 1) Threads where title/content matches
-
   const threadRows = forumFilter
-    ? db
-        .prepare<[string, string, string], { tid: number }>(
-          `
+    ? await queryAll<{ tid: number }>(
+        `
           SELECT t.tid AS tid
           FROM thread t
           JOIN forum f
@@ -628,31 +773,25 @@ export function searchThreadsWithKeywordAndScopes(
           WHERE (t.title LIKE ? OR t.content LIKE ?)
             AND f.forum_name = ?
         `,
-        )
-        .all(likeTerm, likeTerm, forumFilter)
-    : db
-        .prepare<[string, string], { tid: number }>(
-          `
+        [likeTerm, likeTerm, forumFilter],
+      )
+    : await queryAll<{ tid: number }>(
+        `
           SELECT t.tid AS tid
           FROM thread t
           WHERE t.title LIKE ? OR t.content LIKE ?
         `,
-        )
-        .all(likeTerm, likeTerm);
+        [likeTerm, likeTerm],
+      );
 
   for (const row of threadRows) {
     threadMatches.add(row.tid);
   }
 
-  // 2) Posts where content matches (grouped by tid, with first matching pid)
   if (includePosts) {
     const rows = forumFilter
-      ? db
-          .prepare<
-            [string, string],
-            { tid: number; cnt: number; first_pid: number }
-          >(
-            `
+      ? await queryAll<{ tid: number; cnt: number; first_pid: number }>(
+          `
             SELECT p.tid AS tid,
                    COUNT(*) AS cnt,
                    MIN(p.pid) AS first_pid
@@ -665,11 +804,10 @@ export function searchThreadsWithKeywordAndScopes(
               AND f.forum_name = ?
             GROUP BY p.tid
           `,
-          )
-          .all(likeTerm, forumFilter)
-      : db
-          .prepare<[string], { tid: number; cnt: number; first_pid: number }>(
-            `
+          [likeTerm, forumFilter],
+        )
+      : await queryAll<{ tid: number; cnt: number; first_pid: number }>(
+          `
             SELECT p.tid AS tid,
                    COUNT(*) AS cnt,
                    MIN(p.pid) AS first_pid
@@ -677,23 +815,18 @@ export function searchThreadsWithKeywordAndScopes(
             WHERE p.content LIKE ?
             GROUP BY p.tid
           `,
-          )
-          .all(likeTerm);
+          [likeTerm],
+        );
 
     for (const r of rows) {
       postMatchCounts.set(r.tid, { count: r.cnt, firstPid: r.first_pid });
     }
   }
 
-  // 3) Comments where content matches (grouped by tid via post, with first cid)
   if (includeComments) {
     const rows = forumFilter
-      ? db
-          .prepare<
-            [string, string],
-            { tid: number; cnt: number; first_cid: number }
-          >(
-            `
+      ? await queryAll<{ tid: number; cnt: number; first_cid: number }>(
+          `
             SELECT p.tid AS tid,
                    COUNT(*) AS cnt,
                    MIN(c.cid) AS first_cid
@@ -707,11 +840,10 @@ export function searchThreadsWithKeywordAndScopes(
               AND f.forum_name = ?
             GROUP BY p.tid
           `,
-          )
-          .all(likeTerm, forumFilter)
-      : db
-          .prepare<[string], { tid: number; cnt: number; first_cid: number }>(
-            `
+          [likeTerm, forumFilter],
+        )
+      : await queryAll<{ tid: number; cnt: number; first_cid: number }>(
+          `
             SELECT p.tid AS tid,
                    COUNT(*) AS cnt,
                    MIN(c.cid) AS first_cid
@@ -720,8 +852,8 @@ export function searchThreadsWithKeywordAndScopes(
             WHERE c.content LIKE ?
             GROUP BY p.tid
           `,
-          )
-          .all(likeTerm);
+          [likeTerm],
+        );
 
     for (const r of rows) {
       commentMatchCounts.set(r.tid, {
@@ -731,7 +863,6 @@ export function searchThreadsWithKeywordAndScopes(
     }
   }
 
-  // 4) union of all matching threads (from thread/post/comment)
   const allTids = new Set<number>();
   for (const tid of threadMatches) allTids.add(tid);
   for (const tid of postMatchCounts.keys()) allTids.add(tid);
@@ -742,21 +873,16 @@ export function searchThreadsWithKeywordAndScopes(
   const tidList = Array.from(allTids);
   const tidPlaceholders = tidList.map(() => "?").join(",");
 
-  // 5) Fetch base thread info for all tids
-  const baseRows = db
-    .prepare<
-      number[],
-      {
-        id: number;
-        title: string;
-        content: string;
-        created_at: number;
-        updated_at: number;
-        forum_name: string;
-        author_name: string | null;
-      }
-    >(
-      `
+  const baseRows = await queryAll<{
+    id: number;
+    title: string;
+    content: string;
+    created_at: number;
+    updated_at: number;
+    forum_name: string;
+    author_name: string | null;
+  }>(
+    `
       SELECT
         t.tid AS id,
         t.title AS title,
@@ -768,31 +894,29 @@ export function searchThreadsWithKeywordAndScopes(
       FROM thread t
       LEFT JOIN forum f
         ON f.fid = t.forum_id
-      LEFT JOIN user u
+      LEFT JOIN "user" u
         ON u.uid = t.author_id
       LEFT JOIN user_profile up
         ON up.id = u.current_profile_id
       WHERE t.tid IN (${tidPlaceholders})
     `,
-    )
-    .all(...tidList);
+    tidList,
+  );
 
-  // 6) Fetch sample post contents (for firstPid per tid)
-  const postSampleContent = new Map<number, string>(); // tid -> content
+  const postSampleContent = new Map<number, string>();
   if (includePosts && postMatchCounts.size > 0) {
     const firstPids = Array.from(postMatchCounts.values()).map(
       (v) => v.firstPid,
     );
     const placeholders = firstPids.map(() => "?").join(",");
-    const rows = db
-      .prepare<number[], { pid: number; content: string }>(
-        `
+    const rows = await queryAll<{ pid: number; content: string }>(
+      `
         SELECT pid, content
         FROM post
         WHERE pid IN (${placeholders})
       `,
-      )
-      .all(...firstPids);
+      firstPids,
+    );
 
     const pidToContent = new Map<number, string>();
     for (const row of rows) {
@@ -807,22 +931,20 @@ export function searchThreadsWithKeywordAndScopes(
     }
   }
 
-  // 7) Fetch sample comment contents (for firstCid per tid)
-  const commentSampleContent = new Map<number, string>(); // tid -> content
+  const commentSampleContent = new Map<number, string>();
   if (includeComments && commentMatchCounts.size > 0) {
     const firstCids = Array.from(commentMatchCounts.values()).map(
       (v) => v.firstCid,
     );
     const placeholders = firstCids.map(() => "?").join(",");
-    const rows = db
-      .prepare<number[], { cid: number; content: string }>(
-        `
+    const rows = await queryAll<{ cid: number; content: string }>(
+      `
         SELECT cid, content
         FROM comment
         WHERE cid IN (${placeholders})
       `,
-      )
-      .all(...firstCids);
+      firstCids,
+    );
 
     const cidToContent = new Map<number, string>();
     for (const row of rows) {
@@ -837,7 +959,6 @@ export function searchThreadsWithKeywordAndScopes(
     }
   }
 
-  // 8) Combine everything
   const results: (ThreadSearchWithCounts & { updated_at: number })[] =
     baseRows.map((row) => {
       const postInfo = postMatchCounts.get(row.id);
@@ -858,7 +979,6 @@ export function searchThreadsWithKeywordAndScopes(
       };
     });
 
-  // 9) Sort by updated_time desc and apply limit
   results.sort((a, b) => b.updated_at - a.updated_at);
 
   return results.slice(0, limit).map((row) => ({

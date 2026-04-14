@@ -46,7 +46,7 @@ export default async function ThreadPage({
     notFound();
   }
 
-  const data = getThreadWithPostsAndCommentsByFloor(
+  const data = await getThreadWithPostsAndCommentsByFloor(
     parsedThreadId,
     floor,
     50,
